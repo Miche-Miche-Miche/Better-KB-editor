@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Better KB editor
 // @namespace    local.servicenow.better-kb-form
-// @version      0.10.1
-// @description  Sticky shortcuts and editor toolbar, attachment list, collapsible details, full-length editor.
+// @version      0.11.0
+// @description  Sticky shortcuts and editor toolbar, collapsible attachment list and details, full-length editor.
 // @author       Miche (based on Destination LPS KB form by Lucas Vieites)
 // @homepageURL  https://github.com/Miche-Miche-Miche/Better-KB-editor
 // @match        https://*.service-now.com/kb_knowledge.do*
@@ -28,7 +28,9 @@ Roles); the browser remembers the last choice. If a required field in the
 details is empty, they open. Short description sits right below the header.
 - Attachments are listed one per line in a card at the right of the form
 fields (below the header line when the window is too narrow), with
-ServiceNow's own Manage Attachments, rename and download links.
+ServiceNow's own Manage Attachments, rename and download links. The files
+stay hidden until you click Show next to "Manage Attachments (n):"; the
+browser remembers whether the list was last open or closed.
 - The article editor grows to show the whole article, and follows it as you
 type. Its bottom-right handle can still drag it taller. While you scroll a
 long article, the editor's toolbar stays just below the grey bar.
@@ -44,6 +46,7 @@ otherwise its shortcut icons appear as well.
 Maintainers: keep this note and the changelog up to date.
 */
 /** ChangeLog (newest first):
+v0.11.0: Attachment list opens and closes with Show/Hide; closed by default; choice remembered
 v0.10.1: Attachment card: one file per row, name then rename/download; all files shown
 v0.10.0: Show/Hide details in the grey bar; attachment list card; sticky editor toolbar
 v0.9.3: Shorter description and changelog
@@ -107,6 +110,12 @@ Knowledge Blocks, Workspace link, editor style sheet
     ATTACHMENT_SIDE_MIN_PX: 200,
     ATTACHMENT_SIDE_MAX_PX: 320,
     ATTACHMENT_SIDE_GAP_PX: 24,
+    // Hide the files in the attachment card behind a Show/Hide button;
+    // "Manage Attachments (n):" stays visible. Closed until the button is
+    // first used; after that, the last choice is kept (this browser and
+    // ServiceNow instance only). Set to false to always list every file.
+    COLLAPSIBLE_ATTACHMENTS: true,
+    FILES_STORAGE_KEY: 'better-kb-editor:attachments-collapsed',
     // Keep the article editor's toolbar visible while scrolling a long
     // article: once the top of the editor passes under the grey bar, the
     // toolbar stays just below the bar. Set to false to turn it off.
@@ -194,6 +203,8 @@ Knowledge Blocks, Workspace link, editor style sheet
     tools: null,
     toggle: null,
     files: null,
+    filesToggle: null,
+    filesCollapsed: null,
     warning: null,
     status: null,
     parts: [],
@@ -291,7 +302,7 @@ Knowledge Blocks, Workspace link, editor style sheet
     const unique = document.getElementById('sys_uniqueValue');
     return validSysId(unique && unique.value) || validSysId(fromUrl);
   }
-  // Number fields are read-only for most users (sys_readonly. prefix, as in
+  // Number fields are read-only for most users (sys_readonly.prefix, as in
   // the original); the plain ID covers users who may edit the number.
   function findRecord() {
     for (const table of RECORD_TABLES) {
@@ -565,6 +576,29 @@ Knowledge Blocks, Workspace link, editor style sheet
     #${PREFIX}-files #header_attachment_list > li .${PREFIX}-file-action-first { margin-left: 1.65rem !important; }
     #${PREFIX}-files #${ATTACHMENT_HEADER_ID} .plus_more { display: none !important; }
     #${PREFIX}-files #attachment_upload_progress:empty { display: none !important; }
+    /* Show/Hide button for the files, at the top right of the card, beside
+    "Manage Attachments (n):", which keeps room for it on its right (see
+    ensureFilesToggle()). Closed: only ServiceNow's file rows are hidden;
+    these rules sit after (and outrank) the rules above that show them.
+    */
+    .${PREFIX}-files { position: relative; }
+    .${PREFIX}-files-toggle {
+      position: absolute; top: .5rem; right: .6rem; z-index: 1;
+      display: inline-flex; align-items: center; gap: .4em; margin: 0; padding: .1rem .5rem;
+      border: 1px solid var(--${PREFIX}-line); border-radius: 6px;
+      background: var(--${PREFIX}-surface); color: var(--${PREFIX}-accent);
+      font: inherit; font-size: .85em; font-weight: 400; line-height: 1.3; cursor: pointer;
+    }
+    .${PREFIX}-files-toggle:hover { background: var(--${PREFIX}-soft); }
+    .${PREFIX}-files-toggle:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+    .${PREFIX}-files-toggle[hidden] { display: none !important; }
+    .${PREFIX}-files-toggle[aria-expanded="false"] .${PREFIX}-chevron { transform: rotate(-45deg); margin-top: 0; }
+    #${PREFIX}-files.${PREFIX}-files-has-toggle #header_attachment_list > li.manage_list { padding-right: 4.25rem !important; }
+    #${PREFIX}-files.${PREFIX}-files-collapsed #header_attachment_list > li.attachment_list_items,
+    #${PREFIX}-files.${PREFIX}-files-collapsed #header_attachment_list > li.attachment_list_items.hidden {
+      display: none !important;
+    }
+    #${PREFIX}-files.${PREFIX}-files-collapsed #header_attachment_list > li.manage_list { padding-bottom: 0 !important; }
     /* The separator ServiceNow draws under the attachment line, now empty. */
     .${PREFIX}-files-moved #${ATTACHMENT_LINE_ID} { display: none !important; }
     /* Editor toolbar kept visible while scrolling (see updateToolbar()). */
@@ -616,6 +650,22 @@ Knowledge Blocks, Workspace link, editor style sheet
       window.localStorage.setItem(CONFIG.STORAGE_KEY, collapsed ? '1' : '0');
     } catch (_) {
       debug('Could not remember the open/closed choice (storage unavailable).');
+    }
+  }
+  // Only '0' (opened with the button) shows the files; no saved choice yet,
+  // or blocked storage, keeps them closed.
+  function readFilesCollapsed() {
+    try {
+      return window.localStorage.getItem(CONFIG.FILES_STORAGE_KEY) !== '0';
+    } catch (_) {
+      return true;
+    }
+  }
+  function saveFilesCollapsed(collapsed) {
+    try {
+      window.localStorage.setItem(CONFIG.FILES_STORAGE_KEY, collapsed ? '1' : '0');
+    } catch (_) {
+      debug('Could not remember the attachment list choice (storage unavailable).');
     }
   }
   function openPrivate(url) {
@@ -1106,6 +1156,70 @@ Knowledge Blocks, Workspace link, editor style sheet
       }
     }
   }
+  // Show/Hide for the files in the card. The button belongs to the script
+  // and sits in the script's card, before ServiceNow's attachment line, so
+  // it comes first when tabbing. Closing only adds a class to the card, so
+  // ServiceNow's elements and links are untouched and the files stay hidden
+  // when ServiceNow redraws the list (after an upload, for example).
+  function setClass(element, name, on) {
+    if (element.classList.contains(name) !== on) element.classList.toggle(name, on);
+  }
+  function applyFilesCollapsed(collapsed, remember) {
+    state.filesCollapsed = collapsed;
+    if (state.files) setClass(state.files, PREFIX + '-files-collapsed', collapsed);
+    const toggle = state.filesToggle;
+    if (toggle) {
+      const label = collapsed ? 'Show attachments' : 'Hide attachments';
+      if (toggle.getAttribute('aria-expanded') !== String(!collapsed)) toggle.setAttribute('aria-expanded', String(!collapsed));
+      if (toggle.getAttribute('aria-label') !== label) toggle.setAttribute('aria-label', label);
+      if (toggle.title !== label) toggle.title = label;
+      // Text is only written when it changes: each write is a page change
+      // that the page observer would otherwise answer with another check.
+      const text = toggle.querySelector('.' + PREFIX + '-files-toggle-text');
+      const word = collapsed ? 'Show' : 'Hide';
+      if (text && text.textContent !== word) text.textContent = word;
+    }
+    if (remember) saveFilesCollapsed(collapsed);
+  }
+  function buildFilesToggle() {
+    const toggle = document.createElement('button');
+    toggle.type = 'button'; // Never submits the ServiceNow form.
+    toggle.className = PREFIX + '-files-toggle';
+    toggle.setAttribute('aria-controls', 'header_attachment_list');
+    const chevron = document.createElement('span');
+    chevron.className = PREFIX + '-chevron';
+    chevron.setAttribute('aria-hidden', 'true');
+    const text = document.createElement('span');
+    text.className = PREFIX + '-files-toggle-text';
+    toggle.append(chevron, text);
+    toggle.addEventListener('click', () => {
+      applyFilesCollapsed(!state.filesCollapsed, true);
+      // In narrow windows the card is part of the page flow, so the editor
+      // moves; re-place the kept-visible toolbar.
+      scheduleToolbar();
+    });
+    return toggle;
+  }
+  // Called after ensureFiles() and markFiles(). The button is hidden when
+  // the card lists no files (ServiceNow keeps the line for an empty list).
+  function ensureFilesToggle() {
+    const files = state.files;
+    if (!CONFIG.COLLAPSIBLE_ATTACHMENTS || !files || !files.isConnected) return;
+    if (state.filesCollapsed === null) state.filesCollapsed = readFilesCollapsed();
+    if (!state.filesToggle) state.filesToggle = buildFilesToggle();
+    const toggle = state.filesToggle;
+    // Moving an element that is already in place still counts as a page
+    // change, so it is only moved when needed.
+    if (files.firstElementChild !== toggle) files.prepend(toggle);
+    const list = files.querySelector('#header_attachment_list');
+    let count = 0;
+    if (list) {
+      for (const item of list.children) if (item.classList.contains('attachment_list_items')) count++;
+    }
+    if (toggle.hidden !== (count === 0)) toggle.hidden = count === 0;
+    setClass(files, PREFIX + '-files-has-toggle', count > 0);
+    applyFilesCollapsed(state.filesCollapsed, false);
+  }
   // At the right of the form fields when there is room for the card (wide
   // windows leave an empty column there), otherwise below the header line.
   // Measured, like alignHeader(), because the column widths depend on the
@@ -1500,6 +1614,7 @@ Knowledge Blocks, Workspace link, editor style sheet
     placeToggle();
     ensureFiles();
     markFiles();
+    ensureFilesToggle();
     updateTitleLink();
     updateStatus();
     alignHeader();
