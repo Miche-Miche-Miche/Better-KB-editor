@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Better KB editor
 // @namespace    local.servicenow.better-kb-form
-// @version      0.11.0
-// @description  Sticky shortcuts and editor toolbar, collapsible attachment list and details, full-length editor.
+// @version      0.12.0
+// @description  Sticky shortcuts and editor toolbar, accordion controls, collapsible attachment list and details, full-length editor.
 // @author       Miche (based on Destination LPS KB form by Lucas Vieites)
 // @homepageURL  https://github.com/Miche-Miche-Miche/Better-KB-editor
 // @match        https://*.service-now.com/kb_knowledge.do*
@@ -34,9 +34,17 @@ browser remembers whether the list was last open or closed.
 - The article editor grows to show the whole article, and follows it as you
 type. Its bottom-right handle can still drag it taller. While you scroll a
 long article, the editor's toolbar stays just below the grey bar.
+- Open/Close accordions, next to Show/Hide details, opens or closes every
+accordion in the article at once; one label at a time, saying what the
+click does, and the browser remembers the last choice.
+- While an accordion is left open, ServiceNow's Publish button is replaced
+by "Close all accordions and publish", which closes them all and then
+runs ServiceNow's own Publish. With none open, Publish is untouched.
 - Tab title "KBnumber - Title", the Check out label and the editor style sheet
 work as in the original script.
 Never saves anything on its own; use ServiceNow's normal Save/Update.
+Opening or closing accordions changes the article in the editor only, so it
+is kept the next time the article is saved or published, like any other edit.
 Formerly "Better KB form". Based on "Destination LPS KB form" v0.5 by Lucas
 Vieites: https://gist.github.com/lucasvieites/49b318e354244cd3cef92ff5c40c713c
 Copy link and the article link come from Better KB shortcuts:
@@ -46,6 +54,7 @@ otherwise its shortcut icons appear as well.
 Maintainers: keep this note and the changelog up to date.
 */
 /** ChangeLog (newest first):
+v0.12.0: Open/Close accordions in the grey bar; Publish closes open accordions first
 v0.11.0: Attachment list opens and closes with Show/Hide; closed by default; choice remembered
 v0.10.1: Attachment card: one file per row, name then rename/download; all files shown
 v0.10.0: Show/Hide details in the grey bar; attachment list card; sticky editor toolbar
@@ -116,6 +125,25 @@ Knowledge Blocks, Workspace link, editor style sheet
     // ServiceNow instance only). Set to false to always list every file.
     COLLAPSIBLE_ATTACHMENTS: true,
     FILES_STORAGE_KEY: 'better-kb-editor:attachments-collapsed',
+    // The accordions in the article (the collapsible blocks TinyMCE marks
+    // .mce-accordion, and any other collapsible block). Open/Close
+    // accordions sits next to Show/Hide details; one label at a time,
+    // saying what the click does. Set to false to leave the accordions to
+    // the editor's own toolbar.
+    ACCORDION_TOGGLE: true,
+    // Apply the remembered Open/Close choice when the form loads. Only the
+    // editor is changed (nothing is ever saved on its own) and the editor is
+    // not told it changed, so a reload alone does not count as an edit. Set
+    // to false to always load the article as it was written.
+    ACCORDION_RESTORE_ON_LOAD: true,
+    ACCORDION_STORAGE_KEY: 'better-kb-editor:accordions-open',
+    // While at least one accordion is open, replace ServiceNow's Publish
+    // button with one that closes them all and then publishes, so a
+    // published article never opens with sections already unfolded. With
+    // none open, ServiceNow's own button is shown, untouched. Set to false
+    // to always publish straight away.
+    PUBLISH_GUARD: true,
+    PUBLISH_LABEL: 'Close all accordions and publish',
     // Keep the article editor's toolbar visible while scrolling a long
     // article: once the top of the editor passes under the grey bar, the
     // toolbar stays just below the bar. Set to false to turn it off.
@@ -177,6 +205,13 @@ Knowledge Blocks, Workspace link, editor style sheet
   // ServiceNow's form UI action buttons in the grey bar carry these classes
   // (the copies at the bottom of the form have no "header" class).
   const FORM_BAR_BUTTON = 'button.form_action_button.header';
+  // Every UI action button on the form, in the grey bar and at the bottom.
+  const FORM_ACTION_BUTTON = 'button.form_action_button';
+  // TinyMCE's accordions in the article are <details class="mce-accordion">
+  // with a <summary> title; any other collapsible block counts as well, so
+  // none is left open by mistake. The browser marks the open ones with the
+  // open attribute.
+  const ACCORDIONS = 'details';
   // ServiceNow's attachment line at the top of the form and the separator
   // under it (exact IDs from the classic form).
   const ATTACHMENT_HEADER_ID = 'header_attachment';
@@ -205,6 +240,8 @@ Knowledge Blocks, Workspace link, editor style sheet
     files: null,
     filesToggle: null,
     filesCollapsed: null,
+    accToggle: null,
+    publish: [],
     warning: null,
     status: null,
     parts: [],
@@ -601,6 +638,17 @@ Knowledge Blocks, Workspace link, editor style sheet
     #${PREFIX}-files.${PREFIX}-files-collapsed #header_attachment_list > li.manage_list { padding-bottom: 0 !important; }
     /* The separator ServiceNow draws under the attachment line, now empty. */
     .${PREFIX}-files-moved #${ATTACHMENT_LINE_ID} { display: none !important; }
+    /* Open/Close accordions: ServiceNow's button classes plus the same
+    chevron as Show/Hide details, so the two look like one pair.
+    */
+    .${PREFIX}-acc-toggle[hidden] { display: none !important; }
+    /* Publish while an accordion is open (see updatePublish()). ServiceNow's
+    own button classes keep the font, text colour and outline; only the
+    background changes, to the light yellow of the Draft lozenge, so the
+    different action stands out without looking like a different button.
+    */
+    .${PREFIX}-publish { background-color: #fbf0d0 !important; }
+    .${PREFIX}-publish:hover, .${PREFIX}-publish:focus-visible { background-color: #f6e4ae !important; }
     /* Editor toolbar kept visible while scrolling (see updateToolbar()). */
     .${PREFIX}-tb-pinned {
       position: fixed !important; top: var(--${PREFIX}-tb-top) !important;
@@ -666,6 +714,23 @@ Knowledge Blocks, Workspace link, editor style sheet
       window.localStorage.setItem(CONFIG.FILES_STORAGE_KEY, collapsed ? '1' : '0');
     } catch (_) {
       debug('Could not remember the attachment list choice (storage unavailable).');
+    }
+  }
+  // null when no choice was made yet in this browser: the article then keeps
+  // the accordions it was written with.
+  function readAccordionsOpen() {
+    try {
+      const value = window.localStorage.getItem(CONFIG.ACCORDION_STORAGE_KEY);
+      return value === null ? null : value === '1';
+    } catch (_) {
+      return null;
+    }
+  }
+  function saveAccordionsOpen(open) {
+    try {
+      window.localStorage.setItem(CONFIG.ACCORDION_STORAGE_KEY, open ? '1' : '0');
+    } catch (_) {
+      debug('Could not remember the accordion choice (storage unavailable).');
     }
   }
   function openPrivate(url) {
@@ -1249,6 +1314,174 @@ Knowledge Blocks, Workspace link, editor style sheet
     if (files.style.left !== left) files.style.left = left;
     if (files.style.width !== width) files.style.width = width;
   }
+  // ---- Accordions and Publish ----------------------------------------------------
+  // doc/observer: the editor document being watched. restored: the remembered
+  // choice has been applied for this page.
+  const acc = { doc: null, observer: null, restored: false, timer: 0 };
+  // The accordions in the article, or none while the editor is still being
+  // built.
+  function accordions() {
+    const doc = editorDocument();
+    if (!doc) return [];
+    return Array.prototype.slice.call(doc.body.querySelectorAll(ACCORDIONS));
+  }
+  // TinyMCE builds what ServiceNow saves from the editor document itself, so
+  // changing the open attribute is already a change to the article. This
+  // event only lets TinyMCE notice it, the way typing would.
+  function markEditorEdited() {
+    const doc = editorDocument();
+    if (!doc) return;
+    try {
+      doc.body.dispatchEvent(new Event('input', { bubbles: true }));
+    } catch (_) {
+      debug('Could not tell the editor that the accordions changed.');
+    }
+  }
+  // Opens or closes every accordion and returns how many changed. edited is
+  // false for the choice restored on load, so a reload on its own is not
+  // reported to the editor as an edit; a click by the user is.
+  function setAccordions(open, edited) {
+    let changed = 0;
+    for (const item of accordions()) {
+      if (item.open === open) continue;
+      item.open = open;
+      changed += 1;
+    }
+    if (changed && edited) markEditorEdited();
+    return changed;
+  }
+  function buildAccordionToggle() {
+    const toggle = document.createElement('button');
+    toggle.type = 'button'; // Never submits the ServiceNow form.
+    toggle.className = 'btn btn-default ' + PREFIX + '-toggle ' + PREFIX + '-acc-toggle';
+    const chevron = document.createElement('span');
+    chevron.className = PREFIX + '-chevron';
+    chevron.setAttribute('aria-hidden', 'true');
+    const text = document.createElement('span');
+    text.className = PREFIX + '-acc-text';
+    toggle.append(chevron, text);
+    toggle.addEventListener('click', () => {
+      // The label says what the click does: with nothing open it opens
+      // everything, otherwise it closes everything.
+      const open = !accordions().some((item) => item.open);
+      setAccordions(open, true);
+      saveAccordionsOpen(open);
+      updateAccordions();
+      scheduleFit(); // The article's height changes with the accordions.
+    });
+    return toggle;
+  }
+  // Right after Show/Hide details, wherever placeToggle() put it (the grey
+  // bar, or the header when the bar cannot be identified). The same button
+  // moves, so its state and keyboard focus are kept.
+  function ensureAccordionToggle() {
+    if (!CONFIG.ACCORDION_TOGGLE) return;
+    if (!state.accToggle) state.accToggle = buildAccordionToggle();
+    const toggle = state.accToggle;
+    const details = state.toggle && state.toggle.isConnected ? state.toggle : null;
+    const target = details ? details.parentElement :
+      (state.tools && state.tools.isConnected ? state.tools : null);
+    if (!target) return;
+    if (toggle.parentElement === target && toggle.previousElementSibling === details) return;
+    const hadFocus = document.activeElement === toggle;
+    target.insertBefore(toggle, details ? details.nextSibling : target.firstChild);
+    if (hadFocus && document.activeElement !== toggle) toggle.focus();
+  }
+  // ServiceNow's Publish button, by its label: its ID is instance-specific.
+  // Ours is skipped (its label ends in "publish" as well).
+  function publishButtons() {
+    const found = [];
+    for (const button of document.querySelectorAll(FORM_ACTION_BUTTON)) {
+      if (button.classList.contains(PREFIX + '-publish')) continue;
+      if (button.textContent.trim().toLowerCase() === 'publish') found.push(button);
+    }
+    return found;
+  }
+  // The replacement for one Publish button: closes the accordions, then
+  // clicks ServiceNow's own button, so publishing itself is unchanged.
+  function buildPublishButton(real) {
+    const button = document.createElement('button');
+    button.type = 'button'; // The click on ServiceNow's button submits.
+    button.className = real.className + ' ' + PREFIX + '-publish ' + PREFIX + '-hidden';
+    button.textContent = CONFIG.PUBLISH_LABEL;
+    button.title = 'Closes every open accordion in the article, then publishes';
+    button.addEventListener('click', () => {
+      setAccordions(false, true);
+      saveAccordionsOpen(false);
+      updateAccordions();
+      real.click();
+    });
+    return button;
+  }
+  // One replacement next to each Publish button, rebuilt if ServiceNow
+  // renders the form's buttons again.
+  function ensurePublishButtons() {
+    if (!CONFIG.PUBLISH_GUARD) return;
+    state.publish = state.publish.filter((pair) => pair.real.isConnected && pair.button.isConnected);
+    for (const real of publishButtons()) {
+      if (state.publish.some((pair) => pair.real === real)) continue;
+      const button = buildPublishButton(real);
+      real.insertAdjacentElement('beforebegin', button);
+      state.publish.push({ real, button });
+    }
+  }
+  // With an accordion open, the replacement takes the place of ServiceNow's
+  // button; with none open, ServiceNow's own button is the only one shown.
+  function updatePublish(open) {
+    for (const pair of state.publish) {
+      setClass(pair.real, PREFIX + '-hidden', open > 0);
+      setClass(pair.button, PREFIX + '-hidden', open === 0);
+    }
+  }
+  // The button's label follows the accordions, and Publish follows the open
+  // ones. Text and attributes are only written when they change: each write
+  // is a page change that the page observer would answer with another check.
+  function updateAccordions() {
+    const items = accordions();
+    const open = items.filter((item) => item.open).length;
+    const toggle = state.accToggle;
+    if (toggle) {
+      const show = items.length > 0; // Nothing to open or close otherwise.
+      if (toggle.hidden === show) toggle.hidden = !show;
+      const label = open ? 'Close accordions' : 'Open accordions';
+      const expanded = String(open > 0);
+      if (toggle.getAttribute('aria-expanded') !== expanded) toggle.setAttribute('aria-expanded', expanded);
+      if (toggle.title !== label) toggle.title = label;
+      const text = toggle.querySelector('.' + PREFIX + '-acc-text');
+      if (text && text.textContent !== label) text.textContent = label;
+    }
+    updatePublish(open);
+  }
+  // The remembered choice, applied once the editor has built the article.
+  // With no choice made yet, the article is left as it was written.
+  function restoreAccordions() {
+    if (!CONFIG.ACCORDION_RESTORE_ON_LOAD || acc.restored) return;
+    if (!accordions().length) return; // Editor not ready, or no accordions.
+    acc.restored = true;
+    const remembered = readAccordionsOpen();
+    if (remembered === null) return;
+    if (setAccordions(remembered, false)) scheduleFit();
+  }
+  // Changes inside the editor document are not page changes, so the article
+  // has its own observer; only added or removed blocks and the open
+  // attribute are watched, and the answer is batched, so typing costs
+  // nothing.
+  function watchAccordions() {
+    const doc = editorDocument();
+    if (!doc || acc.doc === doc) return;
+    if (acc.observer) acc.observer.disconnect();
+    acc.doc = doc;
+    acc.observer = new MutationObserver(() => {
+      if (acc.timer) return;
+      acc.timer = window.setTimeout(() => {
+        acc.timer = 0;
+        updateAccordions();
+        }, CONFIG.CHECK_DEBOUNCE_MS);
+    });
+    acc.observer.observe(doc.body, {
+      childList: true, subtree: true, attributes: true, attributeFilter: ['open']
+    });
+  }
   // ---- Original script features ----------------------------------------------
   // The form usually sits in ServiceNow's navigation frame; the tab title
   // belongs to the top window (same instance, so access is allowed). The
@@ -1622,6 +1855,11 @@ Knowledge Blocks, Workspace link, editor style sheet
     alignDock();
     placeFiles();
     ensureEditorStylesheet(record);
+    ensureAccordionToggle();
+    ensurePublishButtons();
+    watchAccordions();
+    restoreAccordions();
+    updateAccordions();
     prepareResizeHandle();
     fitEditor();
     fixCheckoutLabel();
@@ -1662,4 +1900,4 @@ Knowledge Blocks, Workspace link, editor style sheet
     expandOnError(records);
     scheduleCheck();
   }).observe(document.documentElement, { childList: true, subtree: true });
-})();
+})(); 
